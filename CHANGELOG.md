@@ -5,6 +5,8 @@
 
 ### Added
 
+- **The Skills panel sidebar can now sort by Name or Modified.** A small toggle above the skills list switches between **Name** (the existing category-grouped alphabetical view, still the default) and **Modified** (a flat list ordered by `SKILL.md` modification time, newest first) so you can quickly find skills you've just been editing. Your choice persists across reloads via `localStorage`. This is a power-user QoL touch on the Skills panel only — it changes nothing about chat. Salvaged from #3557, thanks @yuanhun. (#3557)
+
 - **`/moa` now works in the WebUI, routing the turn through your configured Mixture-of-Agents preset.** Typing `/moa <prompt>` runs that turn through the agent's MoA config (the same preset/usage you'd get from the CLI) instead of a plain single-model turn; `/moa` with no prompt shows the available usage. The MoA config is resolved **server-side** from your profile config — the browser only signals that an override is wanted, it can't supply the config — and it's applied per-turn (not persisted). It fails closed on gateway-backed sessions. Thanks @rodboev. (#5070, #5057)
 
 - **Three new opt-in appearance skins: GitHub, Codex, and Terracotta.** All are CSS-only, namespaced under `[data-skin]`, and selectable from Settings → Appearance — they change nothing unless you pick them. GitHub uses a restrained graphite + Primer-blue palette; Codex a minimal editor look with a muted sage accent; Terracotta a warm clay accent on a soft neutral background. Thanks @gottipx (GitHub #4634, Codex #4636, Terracotta #4635 — renamed from the originally-proposed name to a descriptive material name).
