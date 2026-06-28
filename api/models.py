@@ -3963,19 +3963,107 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
 
 
 def _state_projection_sidecar_metadata(sid: str) -> dict:
-    """Return UI-owned metadata for a state.db-projected sidebar row."""
+    """Return UI-owned metadata for a state.db-projected sidebar row.
+
+    Lookup order:
+      1. WebUI-owned sidecar at ``$HERMES_WEBUI_STATE_DIR/sessions/<sid>.json``
+         (sidebar renames, archives, user-edited titles).
+      2. Hermes agent platform session registry at
+         ``$HERMES_HOME/sessions/sessions.json`` (per-platform ``display_name``
+         for webhook/discord/telegram etc.).  Webhook routes set
+         ``chat_topic`` at session creation, but state.db's ``sessions.title``
+         stays NULL because ``hermes_state._insert_session_row`` only inserts
+         a fixed schema subset — without this fallback the sidebar would show
+         ``"Webhook Session"`` for every webhook session forever (#webhook-title).
+      3. Returns ``{"title": None, "archived": False}`` if neither source has
+         a record for ``sid``.
+    """
     metadata = {"title": None, "archived": False}
+    # 1. WebUI sidecar — user-controlled title wins when present.
     try:
         webui_meta = Session.load_metadata_only(sid)
     except Exception:
+        webui_meta = None
+    if webui_meta:
+        title = getattr(webui_meta, 'title', None)
+        if title:
+            metadata["title"] = title
+        metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+        if metadata["title"]:
+            return metadata
+    # 2. Hermes agent platform registry fallback (webhook chat_topic etc.).
+    if metadata["title"]:
         return metadata
-    if not webui_meta:
-        return metadata
-    title = getattr(webui_meta, 'title', None)
-    if title:
-        metadata["title"] = title
-    metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+    platform_title = _platform_session_display_name(sid)
+    if platform_title:
+        metadata["title"] = platform_title
     return metadata
+
+
+# Module-level cache to avoid re-parsing the (large) sessions.json on every
+# sidebar render.  Keyed by hermes_home to keep profiles isolated.
+_PLATFORM_SESSIONS_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
+_PLATFORM_SESSIONS_TTL_SECONDS = 5.0
+
+
+def _platform_session_display_name(sid: str) -> str | None:
+    """Return the ``display_name`` for ``sid`` from the platform registry.
+
+    Reads ``<hermes_home>/sessions/sessions.json`` where the gateway writes
+    per-session metadata (display_name, chat_topic, platform, etc.). Returns
+    None when the file or sid is missing, or when parsing fails — callers
+    must handle None gracefully and fall back to the source-derived title
+    ("Webhook Session", "Discord Session", ...).
+
+    Resolves hermes_home from the ``HERMES_HOME`` env var first so that a
+    WebUI process launched with ``HERMES_HOME=~/.hermes/profiles/dockerdev``
+    always reads its own profile's sessions.json.  Falls back to
+    ``get_active_hermes_home()`` (per-request cookie / active_profile file)
+    and finally the platform default.
+    """
+    hermes_home: Path | None = None
+    env_home = os.getenv('HERMES_HOME', '').strip()
+    if env_home:
+        hermes_home = Path(env_home).expanduser().resolve()
+    if hermes_home is None:
+        try:
+            from api.profiles import get_active_hermes_home
+            hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
+        except Exception:
+            hermes_home = None
+    if hermes_home is None:
+        hermes_home = Path(HOME / '.hermes').expanduser().resolve()
+    sessions_json = hermes_home / 'sessions' / 'sessions.json'
+    if not sessions_json.exists():
+        return None
+    cache_key = str(hermes_home)
+    now = time.monotonic()
+    cached = _PLATFORM_SESSIONS_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        entries = cached[1]
+    else:
+        try:
+            with open(sessions_json, 'r', encoding='utf-8', errors='replace') as f:
+                raw = f.read()
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        # Build sid -> entry map (skip entries without a session_id).
+        entries = {}
+        for entry in parsed.values() if isinstance(parsed, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            entry_sid = entry.get('session_id')
+            if entry_sid:
+                entries[str(entry_sid)] = entry
+        _PLATFORM_SESSIONS_CACHE[cache_key] = (now + _PLATFORM_SESSIONS_TTL_SECONDS, entries)
+    entry = entries.get(str(sid))
+    if not entry:
+        return None
+    display_name = entry.get('display_name')
+    if display_name and isinstance(display_name, str) and display_name.strip():
+        return display_name.strip()
+    return None
 
 
 def _load_cli_sessions_uncached(
@@ -4045,12 +4133,13 @@ def _load_cli_sessions_uncached(
                 except Exception:
                     pass  # degrade gracefully
         # If a WebUI JSON file exists for this session (e.g. previously
-        # imported or renamed in the sidebar), prefer its UI-owned metadata over
-        # the state.db projection. This keeps archived cron/tool/API runs hidden
-        # even when all_sessions() omits the hidden sidecar and the state row is
-        # re-injected from Hermes state.db (#4397).
+        # imported or renamed in the sidebar), preserve UI-owned archive state.
+        # For titles, keep state.db authoritative when it already has a real
+        # generated/user title; only fall back to the platform display_name
+        # when state.db has no title. Otherwise webhook rows with concise
+        # generated titles get overwritten by long chat_topic strings.
         _sidecar_meta = _state_projection_sidecar_metadata(sid)
-        if _sidecar_meta.get('title'):
+        if not _title and _sidecar_meta.get('title'):
             _title = _sidecar_meta['title']
         _archived = bool(_sidecar_meta.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
@@ -4134,7 +4223,7 @@ def _load_cli_sessions_uncached(
                         except Exception:
                             pass
                 _sidecar_meta = _state_projection_sidecar_metadata(sid)
-                if _sidecar_meta.get('title'):
+                if not _title and _sidecar_meta.get('title'):
                     _title = _sidecar_meta['title']
                 _archived = bool(_sidecar_meta.get('archived'))
                 _display_title = _title or 'Cron Session'
@@ -4177,7 +4266,74 @@ def _load_cli_sessions_uncached(
         except Exception:
             logger.debug("Cron project-chip second pass failed", exc_info=True)
 
+    # Sidebar streaming indicator for webhook sessions: stamp `is_streaming`
+    # on any session whose gateway run is currently active. Without this,
+    # sidebar rows for webhook sessions never show the orange spinner
+    # (the local `is_streaming` flag is only set by the WebUI-side chat
+    # path, see models.py:_is_streaming_session). Live updates from
+    # webhook runs flow through `_live_run_router_push` into the gateway's
+    # SSE queue — we ask the gateway "is this session_id actively running?"
+    # via `lookup_run_by_session_id` and short-lived cache the answer so
+    # we don't pay one HTTP roundtrip per render.
+    _enrich_webhook_sessions_streaming_flag(cli_sessions)
+
     return cli_sessions
+
+
+_WEBHOOK_STREAMING_CACHE: dict[str, tuple[bool, float]] = {}
+_WEBHOOK_STREAMING_TTL_SECONDS = 5.0
+
+
+def _enrich_webhook_sessions_streaming_flag(cli_sessions: list) -> None:
+    """Annotate webhook sessions with ``is_streaming`` from gateway run status.
+
+    Mutates each dict in-place when ``source_tag == 'webhook'`` (the row's
+    raw ``source`` from state.db — what ``_load_cli_sessions_uncached`` copies
+    to ``source_tag``). The dedicated ``session_source`` column doesn't exist
+    on state.db so it's projected as ``'other'`` and is NOT a reliable
+    webhook marker.  No-op if the gateway client isn't configured or all
+    lookups fail.
+    """
+    if not cli_sessions:
+        return
+    webhook_ids = [
+        s["session_id"] for s in cli_sessions
+        if (s.get("source_tag") == "webhook" or s.get("source") == "webhook")
+        and s.get("session_id")
+    ]
+    if not webhook_ids:
+        return
+    try:
+        from api.runner_client import HttpRunnerClient, RunnerClientError
+        from api.gateway_chat import _gateway_base_url, _gateway_api_key
+        from api.config import get_config as _get_config
+    except Exception:
+        return
+    cfg = _get_config()
+    base = _gateway_base_url(cfg)
+    key = _gateway_api_key()
+    if not base or not key:
+        return
+    client = HttpRunnerClient(base_url=base, api_key=key)
+    now = time.monotonic()
+    for sid in webhook_ids:
+        cached = _WEBHOOK_STREAMING_CACHE.get(sid)
+        if cached and cached[1] > now:
+            is_streaming = cached[0]
+        else:
+            is_streaming = False
+            try:
+                result = client.lookup_run_by_session_id(sid)
+                status = (result or {}).get("status")
+                is_streaming = status in ("running", "waiting_for_approval", "queued")
+            except (RunnerClientError, Exception):
+                pass
+            _WEBHOOK_STREAMING_CACHE[sid] = (is_streaming, now + _WEBHOOK_STREAMING_TTL_SECONDS)
+        # Apply to every matching row in the list (a session can appear in
+        # both the main pass and the cron-second-pass; annotate both).
+        for s in cli_sessions:
+            if s.get("session_id") == sid:
+                s["is_streaming"] = is_streaming
 
 
 def get_cli_sessions(source_filter=None, *, all_profiles: bool = False) -> list:

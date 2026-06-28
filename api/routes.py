@@ -21,10 +21,15 @@ import sys
 import threading
 import time
 import uuid
+import hmac
+import hashlib
+import base64
+import binascii
 from collections import defaultdict, OrderedDict
 from pathlib import Path
 from contextlib import closing
 from urllib.parse import parse_qs, urlsplit
+import urllib.error
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -1758,7 +1763,14 @@ def _session_list_cache_overlay_runtime_rows(rows: list[dict]) -> list[dict]:
                 getattr(live, "pending_user_message", None)
             )
         stream_id = item.get("active_stream_id")
-        item["is_streaming"] = bool(stream_id and stream_id in active_stream_ids)
+        # Webhook / external sessions don't live in WebUI's SESSIONS dict and
+        # have no active_stream_id — their is_streaming flag is set upstream
+        # by `_enrich_webhook_sessions_streaming_flag()` from the gateway
+        # runner's live_run status.  Only override to True when we have
+        # authoritative local evidence; preserve upstream True (don't clobber
+        # with False for external sessions).
+        if stream_id and stream_id in active_stream_ids:
+            item["is_streaming"] = True
         overlaid.append(item)
     return overlaid
 
@@ -2768,7 +2780,7 @@ def _csrf_exempt_path(path: str) -> bool:
         "/api/auth/passkey/options",
         "/api/auth/passkey/login",
         "/api/csp-report",
-    }
+    } or path.startswith("/api/webhook/")
 
 
 _CSRF_FAILURE_ATTR = "_hermes_csrf_failure_reason"
@@ -4831,6 +4843,26 @@ def _message_summary(messages) -> dict:
         except (TypeError, ValueError):
             pass
     return {"message_count": len(messages), "last_message_at": last_message_at}
+
+
+def _apply_state_title_to_session_detail(session_payload: dict, state_meta: dict | None, sidecar_session) -> dict:
+    """Return /api/session payload with state.db's title when safe.
+
+    Imported external sidecars can be created while state.db still has no title.
+    When Hermes later generates a concise title, the sidebar projection sees it
+    from state.db but the detail endpoint would keep returning the old sidecar
+    title (often a long webhook chat_topic). Preserve explicit WebUI renames via
+    ``manual_title``; otherwise state.db is the canonical title for imported
+    agent sessions.
+    """
+    if not isinstance(session_payload, dict) or not isinstance(state_meta, dict):
+        return session_payload
+    state_title = str(state_meta.get("title") or "").strip()
+    if state_title and not bool(getattr(sidecar_session, "manual_title", False)):
+        out = dict(session_payload)
+        out["title"] = state_title
+        return out
+    return session_payload
 
 
 def _metadata_only_message_summary(sid: str, profile: str | None = None) -> dict:
@@ -7782,6 +7814,7 @@ def handle_get(handler, parsed) -> bool:
                     float(raw.get("updated_at") or 0),
                     _merged_last_message_at,
                 )
+            raw = _apply_state_title_to_session_detail(raw, cli_meta, s)
             if cli_meta and _session_source_is_webui(cli_meta):
                 raw = _reconcile_session_detail_source_flags(raw, cli_meta)
             elif cli_meta and _is_messaging_session_record(cli_meta):
@@ -8223,6 +8256,9 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/session/stream":
         return _handle_session_sse_stream(handler, parsed)
 
+    if parsed.path == "/api/session/live_run":
+        return _handle_session_live_run(handler, parsed)
+
     if parsed.path == "/api/clarify/inject_test":
         # Loopback-only: used by automated tests; blocked from any remote client
         if handler.client_address[0] != "127.0.0.1":
@@ -8595,6 +8631,378 @@ def _require_passkey_registration_auth(handler) -> tuple[bool, str, int]:
         return False, "Authentication required", 401
     return True, "", 200
 
+
+# ============================================================================
+# Webhook receive endpoint (POST /api/webhook/{name})
+# ============================================================================
+#
+# Lets external services (GitHub, GitLab, custom) inject a prompt as if a
+# human had clicked Send in the WebUI. The conversation is created via
+# ``new_session`` and started via ``start_session_turn`` — the same internal
+# entry points the browser uses, so the resulting session renders through the
+# existing chat pipeline (no external-run special cases).
+#
+# Routes are managed out-of-band via ``hermes webhook subscribe`` and persisted
+# to ``$HERMES_HOME/webhook_subscriptions.json`` — this endpoint reads the
+# same file, so gateway-side and webui-side routes stay in sync.
+#
+# Security model:
+#   1. HMAC signature validation (GitHub X-Hub-Signature-256, GitLab token,
+#      Svix, or generic X-Webhook-Signature). Reject 401 on mismatch.
+#   2. Idempotency via X-GitHub-Delivery / X-Request-ID, 1h TTL.
+#   3. CSRF exempt (HMAC is the real gate; a browser cannot forge the sig).
+
+_WEBHOOK_DELIVERY_CACHE: dict[str, float] = {}
+_WEBHOOK_DELIVERY_TTL = 3600.0
+_WEBHOOK_MAX_BODY_BYTES = 1_048_576  # 1 MB
+_WEBHOOK_SUBSCRIPTIONS_FILENAME = "webhook_subscriptions.json"
+
+
+def _webhook_subscriptions_path() -> Path:
+    """Resolve the subscription file from the active profile's HERMES_HOME.
+
+    We deliberately use the live ``os.environ`` rather than the cached
+    ``api.config.get_config()["hermes_home"]``: the latter is snapshotted
+    at config-load time, but the webhook route lives next to the *active*
+    profile's state — and the active profile can change at runtime (cron
+    profile context, per-request profile cookie, etc.). Reading
+    ``HERMES_HOME`` directly keeps the file lookup correct under those
+    switches; the cfg cache may still be valid for *its own* keys, just
+    not for this one.
+    """
+    candidates = []
+    # 1. Active profile's HERMES_HOME (may be inside a profile context).
+    # 2. ``HERMES_HOME`` env var at request time.
+    # 3. The platform default ~/.hermes.
+    try:
+        from api.profiles import get_active_hermes_home
+        candidates.append(get_active_hermes_home() / _WEBHOOK_SUBSCRIPTIONS_FILENAME)
+    except Exception:
+        pass
+    env_home = os.environ.get("HERMES_HOME")
+    if env_home:
+        candidates.append(Path(env_home) / _WEBHOOK_SUBSCRIPTIONS_FILENAME)
+    candidates.append(Path.home() / ".hermes" / _WEBHOOK_SUBSCRIPTIONS_FILENAME)
+    for p in candidates:
+        if p.exists():
+            return p
+    # Fall through to the first candidate so the loader surfaces a clear
+    # "file not found" rather than silently picking the wrong one.
+    return candidates[0]
+
+
+def _load_webhook_subscription(name: str) -> dict | None:
+    """Read a single webhook route from $HERMES_HOME/webhook_subscriptions.json."""
+    try:
+        path = _webhook_subscriptions_path()
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        entry = data.get(name)
+        return entry if isinstance(entry, dict) else None
+    except Exception:
+        return None
+
+
+def _webhook_seen_delivery(delivery_id: str) -> bool:
+    """Return True if the delivery_id was already accepted in the last hour.
+
+    Implements a process-local 1h TTL cache. Mirrors the gateway's
+    idempotency guard so retries (GitHub re-posts the same delivery within
+    a few seconds) collapse to a single accepted response.
+    """
+    now = time.time()
+    expired = [k for k, ts in _WEBHOOK_DELIVERY_CACHE.items() if now - ts > _WEBHOOK_DELIVERY_TTL]
+    for k in expired:
+        _WEBHOOK_DELIVERY_CACHE.pop(k, None)
+    if delivery_id in _WEBHOOK_DELIVERY_CACHE:
+        return True
+    _WEBHOOK_DELIVERY_CACHE[delivery_id] = now
+    return False
+
+
+def _validate_webhook_signature(secret: str, headers, body: bytes) -> bool:
+    """GitHub / GitLab / Svix / generic HMAC signature check.
+
+    Ported from ``gateway/platforms/webhook.py:_validate_signature`` so a
+    route secret configured via ``hermes webhook subscribe`` works the
+    same whether the event lands at the gateway or the WebUI.
+    """
+    def _h(name: str) -> str:
+        v = headers.get(name) or headers.get(name.lower()) or headers.get(name.upper())
+        return v or ""
+
+    # Svix / AgentMail: signed content is "{id}.{timestamp}.{raw_body}".
+    svix_id = _h("svix-id")
+    svix_ts = _h("svix-timestamp")
+    svix_sig = _h("svix-signature")
+    if svix_id or svix_ts or svix_sig:
+        if not (svix_id and svix_ts and svix_sig):
+            return False
+        try:
+            ts = int(svix_ts)
+        except (TypeError, ValueError):
+            return False
+        if abs(int(time.time()) - ts) > 300:
+            return False
+        if secret.startswith("whsec_"):
+            try:
+                key = base64.b64decode(secret.removeprefix("whsec_"), validate=True)
+            except (binascii.Error, ValueError):
+                return False
+        else:
+            key = secret.encode()
+        signed = svix_id.encode() + b"." + svix_ts.encode() + b"." + body
+        expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+        for part in svix_sig.split():
+            try:
+                version, signature = part.split(",", 1)
+            except ValueError:
+                continue
+            if version == "v1" and hmac.compare_digest(signature, expected):
+                return True
+        return False
+
+    # GitHub: X-Hub-Signature-256 = sha256=<hex>
+    gh_sig = _h("X-Hub-Signature-256")
+    if gh_sig:
+        expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(gh_sig, expected)
+
+    # GitLab: X-Gitlab-Token = <plain secret>
+    gl_token = _h("X-Gitlab-Token")
+    if gl_token:
+        return hmac.compare_digest(gl_token, secret)
+
+    # Generic: X-Webhook-Signature = <hex HMAC-SHA256>
+    generic = _h("X-Webhook-Signature")
+    if generic:
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(generic, expected)
+
+    return False
+
+
+def _render_webhook_prompt(template: str, payload: dict, event_type: str, route_name: str) -> str:
+    """Render a ``{a.b.c}`` template against the webhook payload.
+
+    Mirrors ``gateway/platforms/webhook.py:_render_prompt`` — dot-notation
+    access into nested dicts, ``{__raw__}`` dumps the whole payload as
+    truncated JSON. Keeps route configs portable between the gateway and
+    the WebUI receive endpoint.
+    """
+    if not template:
+        truncated = json.dumps(payload, indent=2)[:4000]
+        return f"Webhook event '{event_type}' on route '{route_name}':\n\n```json\n{truncated}\n```"
+
+    def _resolve(match: re.Match) -> str:
+        key = match.group(1)
+        if key == "__raw__":
+            return json.dumps(payload, indent=2)[:4000]
+        value: object = payload
+        for part in key.split("."):
+            if isinstance(value, dict):
+                value = value.get(part, f"{{{key}}}")
+            else:
+                return f"{{{key}}}"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, indent=2)[:2000]
+        return str(value)
+
+    return re.sub(r"\{([a-zA-Z0-9_.]+)\}", _resolve, template)
+
+
+def _webhook_event_type(headers, payload: dict) -> str:
+    return (
+        headers.get("X-GitHub-Event")
+        or headers.get("X-Gitlab-Event")
+        or payload.get("event_type", "")
+        or payload.get("type", "")
+        or "unknown"
+    )
+
+
+def _webhook_session_id_for(route_name: str, payload: dict, delivery_id: str) -> str:
+    """Stable session id derived from the payload (or delivery_id fallback).
+
+    The gateway's webhook adapter does the same via ``session_key_template``;
+    here we use a tiny key=value subset so a re-posted delivery_id maps to
+    the same session, but different PRs / issues do not collide. The
+    session id is purely cosmetic — a real collision just means the second
+    request creates a fresh session.
+    """
+    parts = [route_name]
+    issue = payload.get("issue") or {}
+    pr = payload.get("pull_request") or {}
+    if isinstance(issue, dict) and issue.get("number"):
+        parts.append(f"issue-{issue['number']}")
+    elif isinstance(pr, dict) and pr.get("number"):
+        parts.append(f"pr-{pr['number']}")
+    elif delivery_id:
+        parts.append(delivery_id)
+    else:
+        parts.append(str(int(time.time() * 1000)))
+    return "webhook-" + "-".join(str(p) for p in parts)
+
+
+def _handle_webhook_receive(handler, parsed):
+    """POST /api/webhook/{name} — accept a webhook and spawn a WebUI chat turn.
+
+    This is the WebUI-side equivalent of the gateway's webhook adapter
+    (gateway/platforms/webhook.py), but instead of running the agent in
+    the gateway's external-run registry, it creates a real session via
+    ``new_session`` and starts a turn via ``start_session_turn``. The
+    resulting conversation is a normal WebUI session — no special-case
+    branches in the frontend, no separate SSE machinery, same sidebar,
+    same chat renderer, same persistence.
+    """
+    # 1. Route name from URL: /api/webhook/{name}
+    name = parsed.path[len("/api/webhook/"):].strip("/")
+    if not name:
+        return bad(handler, "missing webhook route name", status=400)
+
+    # 2. Look up subscription config (secret, prompt template, profile, etc.)
+    sub = _load_webhook_subscription(name)
+    if not sub:
+        return bad(handler, f"unknown webhook route: {name}", status=404)
+    if sub.get("enabled", True) is False:
+        return bad(handler, f"webhook route disabled: {name}", status=403)
+
+    # 3. Read raw body for signature validation. CRITICAL: must use
+    #    ``Content-Length`` (validated) — calling ``rfile.read(1MB)`` would
+    #    block until the client closes the stream or the request times out,
+    #    because BaseHTTPRequestHandler.rfile only returns the read amount
+    #    after EOF. The csp-report / client-event helpers use the same
+    #    Content-Length pattern for the same reason.
+    try:
+        length = _safe_content_length(handler, _WEBHOOK_MAX_BODY_BYTES)
+    except ValueError as exc:
+        return bad(handler, str(exc), status=413 if "too large" in str(exc) else 400)
+    if length:
+        try:
+            body_bytes = handler.rfile.read(length)
+        except Exception as exc:
+            return bad(handler, f"failed to read body: {exc}", status=400)
+    else:
+        body_bytes = b""
+
+    secret = sub.get("secret", "")
+    if not secret:
+        logger.warning("[webhook] route %s has no secret; refusing", name)
+        return bad(handler, "webhook route is missing an HMAC secret", status=403)
+    if secret != "__INSECURE_NO_AUTH__" and not _validate_webhook_signature(secret, handler.headers, body_bytes):
+        logger.warning("[webhook] invalid signature for route %s", name)
+        return bad(handler, "invalid signature", status=401)
+
+    # 4. Parse JSON payload (with form-encoded fallback)
+    try:
+        payload = json.loads(body_bytes) if body_bytes else {}
+    except json.JSONDecodeError:
+        try:
+            import urllib.parse
+            payload = dict(urllib.parse.parse_qsl(body_bytes.decode("utf-8")))
+        except Exception:
+            return bad(handler, "cannot parse body", status=400)
+
+    # 5. Event / action filter (matches gateway semantics)
+    event_type = _webhook_event_type(handler.headers, payload)
+    allowed_events = sub.get("events") or []
+    if allowed_events and event_type not in allowed_events:
+        return j(handler, {"status": "ignored", "event": event_type}, status=200)
+    allowed_actions = sub.get("actions") or []
+    if allowed_actions:
+        action = payload.get("action", "")
+        if action and action not in allowed_actions:
+            return j(handler, {"status": "ignored", "event": event_type, "action": action}, status=200)
+
+    # 6. Idempotency: dedup retries on the same delivery id
+    delivery_id = (
+        handler.headers.get("X-GitHub-Delivery")
+        or handler.headers.get("X-Request-ID")
+        or handler.headers.get("svix-id")
+        or str(int(time.time() * 1000))
+    )
+    if _webhook_seen_delivery(delivery_id):
+        return j(handler, {"status": "duplicate", "delivery_id": delivery_id}, status=200)
+
+    # 7. Render prompt + topic from templates
+    prompt = _render_webhook_prompt(sub.get("prompt", ""), payload, event_type, name)
+    title = _render_webhook_prompt(sub.get("chat_topic", ""), payload, event_type, name) or f"webhook: {name}"
+
+    # 8. Resolve workspace (route config overrides, else last workspace, else HOME)
+    workspace = sub.get("workspace")
+    if not workspace:
+        try:
+            from api.workspace import get_last_workspace
+            workspace = get_last_workspace() or str(Path.home())
+        except Exception:
+            workspace = str(Path.home())
+
+    # 9. Resolve target profile. Routes are FORCED onto a named profile —
+    #    webhook-triggered runs must not silently run under whichever profile
+    #    the WebUI happens to be viewing. ``profile`` in the route config is
+    #    the source of truth; if absent, we default to ``dockerdev`` (matches
+    #    the gh.chhmiao.top deployment, where the gateway → webui flow always
+    #    enters the containerised dockerdev profile). Operators can pin a
+    #    different profile by setting it in webhook_subscriptions.json.
+    target_profile = str(sub.get("profile") or "dockerdev").strip() or "dockerdev"
+    try:
+        from api.profiles import get_hermes_home_for_profile
+        target_home = get_hermes_home_for_profile(target_profile)
+    except Exception as exc:
+        logger.exception("[webhook] failed to resolve profile home for %s", target_profile)
+        return bad(handler, f"profile resolution failed: {exc}", status=500)
+
+    # 10. Create the session and start the turn inside a profile context that
+    #     pins HERMES_HOME to the target profile. This ensures the agent reads
+    #     dockerdev's config / model catalog / skills, regardless of which
+    #     profile the WebUI's HTTP request was originally served under.
+    from api.profiles import cron_profile_context_for_home
+    try:
+        with cron_profile_context_for_home(target_home):
+            s = new_session(
+                workspace=workspace,
+                model=sub.get("model"),
+                model_provider=sub.get("model_provider"),
+                profile=target_profile,
+                project_id=None,
+                worktree_info=None,
+            )
+            s.title = title[:200]
+            try:
+                s.save()
+            except Exception:
+                pass
+
+            result = start_session_turn(
+                s.session_id,
+                prompt,
+                source="webhook",
+            )
+    except Exception as exc:
+        logger.exception("[webhook] session/turn failed under profile %s", target_profile)
+        return bad(handler, f"turn start failed: {exc}", status=500)
+
+    status = int(result.pop("_status", 200) or 200)
+    if status >= 400:
+        return j(handler, result, status=status)
+    return j(
+        handler,
+        {
+            "status": "accepted",
+            "route": name,
+            "event": event_type,
+            "delivery_id": delivery_id,
+            "session_id": s.session_id,
+            "stream_id": result.get("stream_id"),
+            "redirect_url": f"/session/{s.session_id}",
+        },
+        status=202,
+    )
+
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger)
@@ -8669,6 +9077,18 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.stage("read_client_event_body")
         return _handle_client_event_log(handler, _read_client_event_payload(handler))
+
+    # Webhook receive (POST /api/webhook/{name}) — handled BEFORE the shared
+    # ``body = read_body(handler)`` call below. The webhook handler must read
+    # the raw body itself to validate the HMAC signature against the exact
+    # bytes on the wire (parsing then re-serialising would silently change
+    # whitespace and break signature verification). If the body is consumed
+    # by read_body first, the handler hangs waiting for bytes that already
+    # left the socket — see the 10-second traceback observed in #1234.
+    if parsed.path == "/api/webhook/{name}" or parsed.path.startswith("/api/webhook/"):
+        if diag:
+            diag.stage("webhook_receive")
+        return _handle_webhook_receive(handler, parsed)
 
     if diag:
         diag.stage("read_body")
@@ -11224,6 +11644,13 @@ def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -
 def _handle_sse_stream(handler, parsed):
     qs = parse_qs(parsed.query)
     stream_id = qs.get("stream_id", [""])[0]
+    # Live-run branch: external (webhook / cron / orchestrator) runs created
+    # outside the WebUI get a `run_…` id, not a WebUI-side stream_id. Hand
+    # them straight to the gateway SSE proxy so the existing chat-stream UI
+    # (attachLiveStream → /api/chat/stream?stream_id=run_xxx) renders webhook
+    # progress identically to a user-driven turn.
+    if stream_id.startswith("run_"):
+        return _proxy_gateway_run_events(handler, stream_id)
     stream = STREAMS.get(stream_id)
     if stream is None:
         if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
@@ -12942,6 +13369,277 @@ def _handle_session_sse_stream(handler, parsed):
         pass  # client went away — normal for long-lived connections
     finally:
         ch.unsubscribe(q)
+
+
+def _handle_session_live_run(handler, parsed):
+    """GET /api/session/live_run?session_id=…
+
+    Proxy to the configured Hermes gateway's ``GET /v1/runs?session_id=…`` so
+    the WebUI can discover whether an external run (webhook delivery with
+    ``live_in_webui: true``, cron-driven agent, orchestrator worker, etc.)
+    is currently active for a Hermes session — and if so, attach to its SSE
+    stream at ``GET /v1/runs/{run_id}/events``.
+
+    Returns a JSON envelope mirroring the gateway's response shape:
+
+        {"run_id": "run_xxx", "session_id": "...", "status": "running",
+         "external_only": true, "source": "webhook"}
+
+    or, when no active run exists:
+
+        {"run_id": null, "session_id": "...", "status": null,
+         "external_only": false, "source": null}
+
+    The frontend uses this in ``loadSession()`` after the initial session
+    fetch — if ``run_id`` is non-null, it opens an ``EventSource`` against
+    ``/api/session/{sid}/live_run_stream`` (which then proxies the SSE
+    stream from the gateway through the WebUI server, keeping the
+    ``API_SERVER_KEY`` off the wire to the browser).
+
+    This endpoint is read-only and safe to call from any tab. We deliberately
+    do NOT create or mutate runs here — that would race the gateway's own
+    session lifecycle. Pure discovery only.
+    """
+    qs = parse_qs(parsed.query)
+    sid = str(qs.get("session_id", [""])[0] or "").strip()
+    if not sid:
+        return bad(handler, "session_id is required")
+
+    _live = _resolve_session_live_run(sid)
+    if _live is None:
+        return j(
+            handler,
+            {
+                "ok": False,
+                "run_id": None,
+                "session_id": sid,
+                "status": None,
+                "error": "Gateway runs API not configured (HERMES_WEBUI_GATEWAY_BASE_URL + API_SERVER_KEY)",
+            },
+            status=503,
+        )
+    if not _live.get("ok"):
+        # Surface the upstream error code (502/404/401) so the frontend can
+        # distinguish "no active run" (404) from real failures.
+        status = int(_live.get("status_code") or 502)
+        return j(handler, _live, status=status if status in (401, 403, 404, 502, 503) else 500)
+    run_id = _live["run_id"]
+    events_url = f"/api/session/{sid}/live_run_stream" if run_id else None
+    return j(
+        handler,
+        {
+            "ok": True,
+            "run_id": run_id,
+            "session_id": sid,
+            "status": _live["status"],
+            "external_only": bool(_live.get("external_only") or run_id),
+            "source": _live.get("source"),
+            "events_url": events_url,
+        },
+    )
+
+
+def _resolve_session_live_run(sid: str) -> dict | None:
+    """Helper for the discovery endpoint: map ``session_id`` → live ``run_id``.
+
+    Returns a normalized dict, or ``None`` when the gateway client is not
+    configured. On upstream error returns ``{"ok": False, "status_code": ...,
+    ...}`` so the caller can surface the right HTTP status.
+    """
+    try:
+        from api.gateway_chat import _gateway_base_url, _gateway_api_key
+        from api.config import get_config as _get_config
+        from api.runner_client import HttpRunnerClient, RunnerClientError
+    except Exception:
+        return None
+
+    _cfg = _get_config()
+    _base = _gateway_base_url(_cfg)
+    _key = _gateway_api_key()
+    if not _base or not _key:
+        return None
+
+    try:
+        result = HttpRunnerClient(base_url=_base, api_key=_key).lookup_run_by_session_id(sid)
+    except (RunnerClientError, urllib.error.HTTPError, Exception):
+        return {"ok": False, "run_id": None, "session_id": sid, "status": None}
+
+    if not isinstance(result, dict):
+        result = {}
+    return {
+        "ok": True,
+        "run_id": result.get("run_id") or None,
+        "session_id": sid,
+        "status": result.get("status") or None,
+        "source": result.get("source"),
+    }
+
+
+def _proxy_gateway_run_events(handler, run_id: str):
+    """SSE proxy: open gateway ``/v1/runs/{run_id}/events`` and translate to
+    WebUI chat-stream event names so the existing ``messages.js`` event
+    listeners (``token``/``tool``/``tool_complete``/``reasoning``/``done``/``error``)
+    render webhook sessions identically to native chat sessions.
+
+    Called from ``_handle_sse_stream`` when ``stream_id`` is a gateway run id
+    (``run_…``) that isn't in WebUI's local STREAMS.
+
+    Translation map (gateway ``data.event`` → SSE ``event:`` line + payload):
+
+    ===================  ====================  ========================================
+    gateway event        WebUI SSE event       payload adjustments
+    ===================  ====================  ========================================
+    ``run.started``      (drop)                — meta only, no UI affordance
+    ``tool.started``     ``tool``              ``name=tool_name, args=args, preview``
+    ``tool.finished``    ``tool_complete``     ``name=tool_name, result=result`` (omit)
+    ``message.delta``    ``token``             ``text=delta``
+    ``reasoning.available``  ``reasoning``     ``text=preview``
+    ``run.completed``    ``done``              ``text=output, usage=usage``
+    ``run.failed``       ``error``             ``error=error, message=error``
+    ``run.cancelled``    ``cancel``            ``message="cancelled"``
+    ===================  ====================  ========================================
+    """
+    from api.gateway_chat import _gateway_base_url, _gateway_api_key
+    from api.config import get_config as _get_config
+    import urllib.request as _ur
+    import urllib.parse as _up
+    import json as _json
+
+    base_url = _gateway_base_url(_get_config())
+    api_key = _gateway_api_key()
+    upstream = f"{base_url.rstrip('/')}/v1/runs/{_up.quote(run_id, safe='')}/events"
+
+    try:
+        upstream_resp = _ur.urlopen(
+            _ur.Request(upstream, headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "text/event-stream",
+            }),
+            timeout=None,
+        )
+    except urllib.error.HTTPError as exc:
+        return bad(handler, f"upstream gateway {exc.code}", status=502)
+    except Exception as exc:
+        return bad(handler, f"upstream gateway unreachable: {exc}", status=502)
+
+    def _write_sse(event_name: str | None, data_obj: dict) -> None:
+        """Write a single SSE record: optional ``event:`` line + ``data:`` JSON + blank."""
+        try:
+            if event_name:
+                handler.wfile.write(f"event: {event_name}\n".encode("utf-8"))
+            handler.wfile.write(f"data: {_json.dumps(data_obj, ensure_ascii=False)}\n\n".encode("utf-8"))
+            handler.wfile.flush()
+        except _CLIENT_DISCONNECT_ERRORS:
+            raise
+
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.end_headers()
+        # Initial comment so EventSource considers the connection open before
+        # the first translated event lands — the gateway may take a moment to
+        # push its first record.
+        handler.wfile.write(b": gateway-run-stream-open\n\n")
+        handler.wfile.flush()
+    except _CLIENT_DISCONNECT_ERRORS:
+        upstream_resp.close()
+        return None
+
+    # Buffer the upstream stream by SSE record (gateway events arrive as
+    # ``data: {...}\n\n`` with no ``event:`` line, so we accumulate until blank).
+    pending_data: list[str] = []
+    try:
+        for raw in upstream_resp:
+            if raw is None:
+                break
+            try:
+                line = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if not line.strip():
+                # End of record — flush.
+                if pending_data:
+                    payload_text = "\n".join(pending_data)
+                    pending_data = []
+                    try:
+                        ev = _json.loads(payload_text)
+                    except Exception:
+                        continue
+                    if not isinstance(ev, dict):
+                        continue
+                    ev_name = str(ev.get("event") or "").strip()
+                    try:
+                        if ev_name == "run.started":
+                            pass  # meta only, no UI affordance
+                        elif ev_name == "tool.started":
+                            _write_sse("tool", {
+                                "name": ev.get("tool_name") or "tool",
+                                "args": ev.get("args") or {},
+                                "preview": ev.get("preview") or "",
+                                "message": ev.get("message") or "",
+                                "run_id": ev.get("run_id"),
+                                "session_id": ev.get("session_id"),
+                            })
+                        elif ev_name == "tool.finished":
+                            _write_sse("tool_complete", {
+                                "name": ev.get("tool_name") or "tool",
+                                "is_error": bool(ev.get("is_error")),
+                                "result_preview": ev.get("result_preview") or "",
+                                "run_id": ev.get("run_id"),
+                                "session_id": ev.get("session_id"),
+                            })
+                        elif ev_name == "message.delta":
+                            _write_sse("token", {"text": ev.get("delta") or ""})
+                        elif ev_name == "reasoning.available":
+                            _write_sse("reasoning", {
+                                "text": ev.get("text") or ev.get("preview") or "",
+                            })
+                        elif ev_name == "run.completed":
+                            _write_sse("done", {
+                                "text": ev.get("output") or "",
+                                "usage": ev.get("usage") or {},
+                                "ok": True,
+                            })
+                        elif ev_name == "run.failed":
+                            _write_sse("error", {
+                                "error": ev.get("error") or "run failed",
+                                "message": ev.get("error") or "run failed",
+                            })
+                        elif ev_name == "run.cancelled":
+                            _write_sse("cancel", {
+                                "message": ev.get("message") or "cancelled",
+                            })
+                        # unknown events are dropped silently
+                    except _CLIENT_DISCONNECT_ERRORS:
+                        break
+                continue
+            if line.startswith(":"):
+                # SSE comment — pass through verbatim.
+                try:
+                    handler.wfile.write(line.encode("utf-8"))
+                    handler.wfile.flush()
+                except _CLIENT_DISCONNECT_ERRORS:
+                    break
+                continue
+            if line.startswith("data:"):
+                pending_data.append(line[5:].lstrip())
+                continue
+            # any other SSE line type — pass through
+            try:
+                handler.wfile.write(line.encode("utf-8"))
+                handler.wfile.flush()
+            except _CLIENT_DISCONNECT_ERRORS:
+                break
+    except _CLIENT_DISCONNECT_ERRORS:
+        pass
+    finally:
+        try:
+            upstream_resp.close()
+        except Exception:
+            pass
+    return None
 
 
 def _handle_clarify_inject(handler, parsed):

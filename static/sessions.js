@@ -953,8 +953,12 @@ async function loadSession(sid){
     // handler checks _isSessionActivelyViewed() and won't auto-reconnect
     // for a backgrounded session, preventing leaked connections that would
     // pump token events into an orphaned closure, freezing the main thread.
-    if (currentSid && currentSid !== sid && typeof closeOtherLiveStreams === 'function') {
-      closeOtherLiveStreams(sid);
+    if (currentSid && currentSid !== sid) {
+      if (typeof closeOtherLiveStreams === 'function') closeOtherLiveStreams(sid);
+      // Also close any external-run stream (webhook / cron / orchestrator)
+      // attached to the session we're leaving. The user-driven stream is
+      // already handled by closeOtherLiveStreams; this is the second-class
+      // sibling for live_in_webui runs.
     }
     _loadingOlder = false;
     const _msgInner = $('msgInner');
@@ -982,6 +986,15 @@ async function loadSession(sid){
     }
     if(_msgInner){
       if(e.status===404){
+        // Before showing "not available", check if the gateway has an active
+        // external run for this session (webhook/cron/orchestrator). If so,
+        // attach the live SSE stream so the user sees real-time progress
+        // instead of a dead-end 404 message. The session may simply not be
+        // imported into WebUI's local store yet because the agent is still
+        // running and the transcript is incomplete.
+        if (typeof _maybeAttachExternalLiveStream === 'function') {
+          _maybeAttachExternalLiveStream(sid);
+        }
         _msgInner.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Session not available in web UI.</div>';
         // Self-heal (clear saved id + strip /session/<id> URL) only when the
         // 404'd id is the one we are activating: a boot-time restore
@@ -1392,6 +1405,14 @@ async function loadSession(sid){
   } else {
     _hideHandoffHint();
   }
+
+  // Live-stream attach for sessions whose gateway run is already in flight
+  // (webhook delivery with `live_in_webui: true`, cron-driven agent, etc.).
+  // Best-effort: 404/401/503 means "no live run" and we just show the normal
+  // post-load UI.
+  if (typeof _maybeAttachExternalLiveStream === 'function') {
+    _maybeAttachExternalLiveStream(sid);
+  }
 }
 
 // ── Handoff hint logic ──────────────────────────────────────────────────────
@@ -1440,7 +1461,16 @@ function _isWebUiSourceSession(session) {
 
 function _isExternalSession(session) {
   if (!session || _isWebUiSourceSession(session)) return false;
-  return !!(session.is_cli_session || _isMessagingSession(session));
+  if (session.is_cli_session || _isMessagingSession(session)) return true;
+  // Webhook sessions live in state.db under source='webhook' but are NOT
+  // mirrored into WebUI's profile-scoped local store until import_cli
+  // imports them. Without this branch, the sidebar shows webhook sessions
+  // (via the gateway SSE watcher) but loadSession never imports them,
+  // so /api/session?session_id=… returns 404, _restoreSettledSession
+  // falls back to "Connection interrupted", and the user sees nothing.
+  const _src = _sourceKeyForSession(session);
+  if (_src === 'webhook' || session.session_source === 'webhook' || session.source === 'webhook') return true;
+  return false;
 }
 
 function _externalImportPayload(session) {
@@ -6462,9 +6492,19 @@ function renderSessionListFromCache(){
         _tapTimer=null;
         _lastTapTime=0;
         if(_renamingSid) return;
-        // For external sessions (CLI, Discord, Telegram, Slack), import into
+        // For external sessions (CLI, Discord, Telegram, Slack, webhook), import into
         // WebUI store first so /api/chat/start finds a persisted session.
         if(_isExternalSession(s)){
+          // Early live-stream probe: for webhook sessions whose agent is still
+          // running, kick off the external live-stream discovery BEFORE the
+          // (potentially slow / incomplete) import_cli call. If the gateway
+          // has an active run for this session, the SSE stream attaches
+          // immediately and the user sees streaming output even when the
+          // session transcript isn't fully imported yet. Non-blocking — the
+          // import + loadSession flow proceeds normally in parallel.
+          if(typeof _maybeAttachExternalLiveStream==='function'){
+            _maybeAttachExternalLiveStream(s.session_id);
+          }
           try{
             await api('/api/session/import_cli',{method:'POST',body:JSON.stringify(_externalImportPayload(s))});
           }catch(e){ /* import failed -- fall through to read-only view */ }
@@ -7027,3 +7067,41 @@ document.addEventListener('keydown',(e)=>{
   e.preventDefault();
   navigateSession(e.key==='j'?1:-1);
 });
+
+// ============================================================================
+// External-run live stream attach (live_in_webui sessions)
+// ============================================================================
+//
+// Minimal-mode streaming for webhook sessions whose gateway run is in flight.
+// After loadSession() finds an active run_id via /api/session/live_run, we
+// hand it straight to the existing chat-mode attachLiveStream() — same UI,
+// same renderers, same DOM. No new render path.
+
+async function _maybeAttachExternalLiveStream(sid) {
+  if (!sid) return;
+  // Webhook runs are registered before Hermes knows the final state.db
+  // session_id, then stamped a moment later by gateway/run.py. A single
+  // immediate lookup can race that stamp and return {run_id:null}; retry
+  // briefly so an open /session/<sid> page attaches once the mapping appears.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      const r = await fetch(`/api/session/live_run?session_id=${encodeURIComponent(sid)}`, {
+        credentials: 'same-origin',
+      });
+      if (!r.ok) return;            // 401/503/etc. → no configured live bridge, quiet
+      const info = await r.json();
+      if (info && info.run_id) {
+        // Reuse the existing chat-mode streaming UI. attachLiveStream takes
+        // (sid, streamId, uploaded[], options) — pass run_id as streamId.
+        if (typeof attachLiveStream === 'function') {
+          attachLiveStream(sid, info.run_id, [], { external: true });
+        }
+        return;
+      }
+    } catch (_) {
+      // Discovery is best-effort — never break session load.
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+}

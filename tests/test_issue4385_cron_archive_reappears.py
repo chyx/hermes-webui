@@ -224,6 +224,112 @@ def test_webhook_state_projection_preserves_archived_sidecar(monkeypatch, tmp_pa
     assert row["archived"] is True
 
 
+def test_webhook_state_db_title_wins_over_long_platform_display_name(monkeypatch, tmp_path):
+    """Concise generated state.db titles should not be overwritten by chat_topic."""
+    import api.models as models
+
+    sid = "webhook_title_20260628"
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                model TEXT,
+                message_count INTEGER,
+                started_at REAL,
+                source TEXT,
+                user_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                id, title, model, message_count, started_at, source, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sid,
+                "修复子模块数量显示为直接子节点数",
+                "test-model",
+                2,
+                20,
+                "webhook",
+                "webhook:github-issues",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES (?, 'user', 'payload', 21)
+            """,
+            (sid,),
+        )
+
+    class LongWebhookSidecar:
+        title = "chyx/hermes-companion-tools #119: [MC-Command] 顶上的bar显示的应该是直接儿子的数量，不应该递归求和吧，不然ui上看着很奇怪"
+        archived = False
+
+    monkeypatch.setattr(
+        models.Session,
+        "load_metadata_only",
+        staticmethod(lambda candidate: LongWebhookSidecar() if candidate == sid else None),
+    )
+
+    rows = models._load_cli_sessions_uncached(
+        tmp_path,
+        db_path,
+        "default",
+        include_claude_code=False,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == sid
+    assert rows[0]["title"] == "修复子模块数量显示为直接子节点数"
+    assert rows[0]["archived"] is False
+
+
+def test_session_detail_uses_state_title_unless_manually_renamed():
+    """Direct /session/<sid> loads should not keep stale webhook chat_topic titles."""
+    import api.routes as routes
+
+    class AutoSidecar:
+        manual_title = False
+
+    class ManualSidecar:
+        manual_title = True
+
+    stale_payload = {"title": "repo #128: [MC-Command] very long webhook title"}
+    state_meta = {"title": "修复文档计数显示矛盾"}
+
+    auto = routes._apply_state_title_to_session_detail(
+        stale_payload,
+        state_meta,
+        AutoSidecar(),
+    )
+    manual = routes._apply_state_title_to_session_detail(
+        stale_payload,
+        state_meta,
+        ManualSidecar(),
+    )
+
+    assert auto["title"] == "修复文档计数显示矛盾"
+    assert manual["title"] == stale_payload["title"]
+
+
 def test_archived_webhook_projection_reaches_sidebar_payload(monkeypatch):
     """The sidebar payload must preserve archived state for webhook projections."""
     import api.routes as routes

@@ -4070,6 +4070,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){}
     }
     const replayParams=(reconnecting||replayOnly)?_runJournalReplayParams():'';
+    // Without this, every listener (token/tool/tool_complete/reasoning/done/…)
+    // early-returns via its `S.activeStreamId !== streamId` guard. The chat
+    // path sets activeStreamId upstream when /api/chat/start returns, so this
+    // line is idempotent for chat sessions — but the webhook-external path
+    // (#_maybeAttachExternalLiveStream) reaches attachLiveStream without
+    // having set it, and the worklog stays blank even though SSE events are
+    // flowing. See comment near the early-return inside `source.addEventListener('tool', …)`.
+    if(S.session && S.session.session_id === activeSid) S.activeStreamId = streamId;
     _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${replayParams}`,document.baseURI||location.href).href,{withCredentials:true}));
   })();
 

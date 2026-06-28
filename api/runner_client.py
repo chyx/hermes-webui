@@ -76,6 +76,22 @@ class HttpRunnerClient:
     def get_run(self, run_id: str) -> dict[str, Any]:
         return self._get(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}")
 
+    def lookup_run_by_session_id(self, session_id: str) -> dict[str, Any]:
+        """Resolve a Hermes ``session_id`` to its currently-running run, if any.
+
+        Hits ``GET /v1/runs?session_id={sid}`` on the runner. The endpoint
+        returns ``{"run_id": "run_xxx", "status": "running", ...}`` when an
+        external run (e.g. a webhook delivery with ``live_in_webui: true``)
+        is in flight for the session, or ``{"run_id": null, "status": null}``
+        when no active run exists.
+
+        Used by the WebUI ``loadSession()`` path to attach to live runs
+        started outside the WebUI itself — webhook agents, cron jobs,
+        multi-agent orchestrator workers, etc.
+        """
+        quoted = urllib.parse.quote(str(session_id), safe="")
+        return self._get(f"/v1/runs?session_id={quoted}")
+
     def cancel_run(self, run_id: str) -> dict[str, Any]:
         return self._post(f"/v1/runs/{urllib.parse.quote(str(run_id), safe='')}/cancel", {})
 
