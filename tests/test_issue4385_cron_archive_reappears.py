@@ -282,6 +282,7 @@ def test_webhook_state_db_title_wins_over_long_platform_display_name(monkeypatch
     class LongWebhookSidecar:
         title = "chyx/hermes-companion-tools #119: [MC-Command] 顶上的bar显示的应该是直接儿子的数量，不应该递归求和吧，不然ui上看着很奇怪"
         archived = False
+        manual_title = False
 
     monkeypatch.setattr(
         models.Session,
@@ -300,6 +301,75 @@ def test_webhook_state_db_title_wins_over_long_platform_display_name(monkeypatch
     assert rows[0]["session_id"] == sid
     assert rows[0]["title"] == "修复子模块数量显示为直接子节点数"
     assert rows[0]["archived"] is False
+
+
+def test_webhook_pending_title_fallback_is_compacted(monkeypatch, tmp_path):
+    """Before final state.db title generation, strip noisy GitHub webhook prefixes."""
+    import api.models as models
+
+    sid = "webhook_pending_20260628"
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                model TEXT,
+                message_count INTEGER,
+                started_at REAL,
+                source TEXT,
+                user_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO sessions (
+                id, title, model, message_count, started_at, source, user_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (sid, None, "test-model", 1, 20, "webhook", "webhook:github-issues"),
+        )
+        conn.execute(
+            """
+            INSERT INTO messages (session_id, role, content, timestamp)
+            VALUES (?, 'user', 'payload', 21)
+            """,
+            (sid,),
+        )
+
+    class AutoWebhookSidecar:
+        title = "chyx/hermes-companion-tools #129: [MC-Command] 这个页面tab里面的issue数量不对。我们应该和文档一样的原则"
+        archived = False
+        manual_title = False
+
+    monkeypatch.setattr(
+        models.Session,
+        "load_metadata_only",
+        staticmethod(lambda candidate: AutoWebhookSidecar() if candidate == sid else None),
+    )
+
+    rows = models._load_cli_sessions_uncached(
+        tmp_path,
+        db_path,
+        "default",
+        include_claude_code=False,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["title"] == "这个页面tab里面的issue数量不对。我们应该和文档一样的原则"
 
 
 def test_session_detail_uses_state_title_unless_manually_renamed():

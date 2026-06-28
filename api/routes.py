@@ -4862,6 +4862,12 @@ def _apply_state_title_to_session_detail(session_payload: dict, state_meta: dict
         out = dict(session_payload)
         out["title"] = state_title
         return out
+    if not bool(getattr(sidecar_session, "manual_title", False)):
+        compact_title = _compact_webhook_display_title(session_payload.get("title"))
+        if compact_title and compact_title != session_payload.get("title"):
+            out = dict(session_payload)
+            out["title"] = compact_title
+            return out
     return session_payload
 
 
@@ -5273,6 +5279,7 @@ from api.models import (
     ensure_cron_project,
     is_cron_session,
     is_safe_session_id,
+    _compact_webhook_display_title,
 )
 from api.workspace import (
     load_workspaces,
@@ -7815,6 +7822,25 @@ def handle_get(handler, parsed) -> bool:
                     _merged_last_message_at,
                 )
             raw = _apply_state_title_to_session_detail(raw, cli_meta, s)
+            if cli_meta and (cli_meta.get("source_tag") == "webhook" or cli_meta.get("source") == "webhook"):
+                try:
+                    _live = _resolve_session_live_run(sid)
+                except Exception:
+                    _live = None
+                _live_status = _live.get("status") if isinstance(_live, dict) else None
+                if (
+                    isinstance(_live, dict)
+                    and _live.get("ok")
+                    and _live.get("run_id")
+                    and _live_status in ("running", "waiting_for_approval", "queued")
+                ):
+                    raw["active_stream_id"] = _live.get("run_id")
+                    raw["is_streaming"] = True
+                    raw["pending_started_at"] = (
+                        raw.get("pending_started_at")
+                        or raw.get("created_at")
+                        or raw.get("started_at")
+                    )
             if cli_meta and _session_source_is_webui(cli_meta):
                 raw = _reconcile_session_detail_source_flags(raw, cli_meta)
             elif cli_meta and _is_messaging_session_record(cli_meta):

@@ -3962,6 +3962,23 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
     return contexts, tuple(cache_entries)
 
 
+def _compact_webhook_display_title(title: str | None) -> str | None:
+    """Trim webhook delivery prefixes from auto-imported GitHub issue titles.
+
+    Webhook sessions can exist for many minutes before Hermes writes a final
+    generated title to state.db. During that window the best available title is
+    the gateway chat_topic, e.g. ``owner/repo #129: [MC-Command] …``. That is a
+    useful lookup key but too noisy for the sidebar/detail title. Keep explicit
+    user renames untouched; callers only apply this to non-manual fallbacks.
+    """
+    raw = str(title or "").strip()
+    if not raw:
+        return None
+    compact = re.sub(r"^[\w.-]+/[\w.-]+\s+#\d+:\s*", "", raw).strip()
+    compact = re.sub(r"^\[MC-Command\]\s*", "", compact).strip()
+    return compact or raw
+
+
 def _state_projection_sidecar_metadata(sid: str) -> dict:
     """Return UI-owned metadata for a state.db-projected sidebar row.
 
@@ -3987,7 +4004,10 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     if webui_meta:
         title = getattr(webui_meta, 'title', None)
         if title:
-            metadata["title"] = title
+            if bool(getattr(webui_meta, 'manual_title', False)):
+                metadata["title"] = title
+            else:
+                metadata["title"] = _compact_webhook_display_title(title) or title
         metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
         if metadata["title"]:
             return metadata
@@ -3996,7 +4016,7 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
         return metadata
     platform_title = _platform_session_display_name(sid)
     if platform_title:
-        metadata["title"] = platform_title
+        metadata["title"] = _compact_webhook_display_title(platform_title) or platform_title
     return metadata
 
 
