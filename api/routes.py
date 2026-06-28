@@ -8213,16 +8213,7 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
-        active = stream_id in STREAMS
-        payload = {"active": active, "stream_id": stream_id, "replay_available": False}
-        try:
-            journal = find_run_summary(stream_id) if stream_id else None
-        except Exception:
-            journal = None
-        if journal:
-            payload["replay_available"] = True
-            payload["journal"] = _run_journal_status_payload(journal, active=active)
-        return j(handler, payload)
+        return j(handler, _chat_stream_status_payload(stream_id))
 
     if parsed.path == "/api/chat/cancel":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
@@ -13463,6 +13454,59 @@ def _handle_session_live_run(handler, parsed):
             "events_url": events_url,
         },
     )
+
+
+def _chat_stream_status_payload(stream_id: str) -> dict:
+    """Build /api/chat/stream/status response, including gateway-owned run_ ids."""
+    stream_id = str(stream_id or "")
+    active = stream_id in STREAMS
+    payload = {"active": active, "stream_id": stream_id, "replay_available": False}
+    if not active and stream_id.startswith("run_"):
+        gateway_status = _resolve_gateway_run_status(stream_id)
+        if gateway_status:
+            state = str(gateway_status.get("status") or "").strip()
+            active = state in ("running", "waiting_for_approval", "queued")
+            payload.update({
+                "active": active,
+                "gateway_run": True,
+                "status": state or None,
+                "source": gateway_status.get("source"),
+                "session_id": gateway_status.get("session_id"),
+                "last_event": gateway_status.get("last_event"),
+                "created_at": gateway_status.get("created_at"),
+                "updated_at": gateway_status.get("updated_at"),
+            })
+    try:
+        journal = find_run_summary(stream_id) if stream_id else None
+    except Exception:
+        journal = None
+    if journal:
+        payload["replay_available"] = True
+        payload["journal"] = _run_journal_status_payload(journal, active=active)
+    return payload
+
+
+def _resolve_gateway_run_status(run_id: str) -> dict | None:
+    """Return gateway ``/v1/runs/{run_id}`` status for external ``run_…`` streams."""
+    run_id = str(run_id or "").strip()
+    if not run_id or not run_id.startswith("run_"):
+        return None
+    try:
+        from api.gateway_chat import _gateway_base_url, _gateway_api_key
+        from api.config import get_config as _get_config
+        from api.runner_client import HttpRunnerClient, RunnerClientError
+    except Exception:
+        return None
+
+    try:
+        base = _gateway_base_url(_get_config())
+        key = _gateway_api_key()
+        if not base or not key:
+            return None
+        status = HttpRunnerClient(base_url=base, api_key=key).get_run(run_id)
+    except (RunnerClientError, Exception):
+        return None
+    return status if isinstance(status, dict) else None
 
 
 def _resolve_session_live_run(sid: str) -> dict | None:
