@@ -5,6 +5,8 @@
 
 ### Added
 
+- **Settings → System now includes a safe, read-only config.yaml viewer.** It renders the active profile's `config.yaml` with every credential-looking value redacted before anything reaches the browser, and lets you copy the redacted YAML. The panel is read-only by design so hidden/redacted secrets can never be overwritten from the UI. Redaction is path-based and unconditional — no credential value of any type (string, number, or boolean) under any sensitive key path reaches the client — plus the existing value-level scrub for secrets pasted into non-secret keys (which honors `api_redact_enabled`). Salvaged from #3228, thanks @AJV20. (#2929)
+
 - **`/moa` now works in the WebUI, routing the turn through your configured Mixture-of-Agents preset.** Typing `/moa <prompt>` runs that turn through the agent's MoA config (the same preset/usage you'd get from the CLI) instead of a plain single-model turn; `/moa` with no prompt shows the available usage. The MoA config is resolved **server-side** from your profile config — the browser only signals that an override is wanted, it can't supply the config — and it's applied per-turn (not persisted). It fails closed on gateway-backed sessions. Thanks @rodboev. (#5070, #5057)
 
 - **Three new opt-in appearance skins: GitHub, Codex, and Terracotta.** All are CSS-only, namespaced under `[data-skin]`, and selectable from Settings → Appearance — they change nothing unless you pick them. GitHub uses a restrained graphite + Primer-blue palette; Codex a minimal editor look with a muted sage accent; Terracotta a warm clay accent on a soft neutral background. Thanks @gottipx (GitHub #4634, Codex #4636, Terracotta #4635 — renamed from the originally-proposed name to a descriptive material name).
