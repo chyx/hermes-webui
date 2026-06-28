@@ -98,6 +98,29 @@ function _isCompactWorkspaceViewport(){
   return window.matchMedia('(max-width: 900px)').matches;
 }
 
+function _isPhoneWidthViewport(){
+  return window.matchMedia('(max-width: 640px)').matches;
+}
+
+// Mobile PWA viewport reflow guard. When the on-screen keyboard / browser
+// chrome shows or hides, visualViewport (or a plain resize on browsers without
+// it) changes height without a layout invalidation, leaving the phone layout
+// painted against stale geometry. Toggling a one-frame `viewport-reflow` class
+// (which applies a cheap GPU-promotion transform under the @media(max-width:640px)
+// rule) forces a repaint, then we resync the workspace panel + sidebar aria.
+function _forceMobileViewportReflow(){
+  if(!_isPhoneWidthViewport()) return;
+  const layout=document.querySelector('.layout');
+  if(!layout) return;
+  document.documentElement.classList.add('viewport-reflow');
+  void layout.offsetWidth;
+  requestAnimationFrame(()=>{
+    document.documentElement.classList.remove('viewport-reflow');
+    try{ syncWorkspacePanelState(); }catch(_){ }
+    try{ if(typeof _syncSidebarAria==='function') _syncSidebarAria(); }catch(_){ }
+  });
+}
+
 function _syncWorkspacePanelInlineWidth(){
   const {panel}= _workspacePanelEls();
   if(!panel) return;
@@ -1838,7 +1861,24 @@ function applyEmptyStateSuggestionPref(){
 window.addEventListener('resize',()=>{
   _syncWorkspacePanelInlineWidth();
   syncWorkspacePanelState();
+  if(!window.visualViewport) _forceMobileViewportReflow();
 });
+
+// On PWAs / mobile browsers that expose visualViewport, keyboard show/hide and
+// URL-bar collapse fire visualViewport resize/scroll rather than window resize.
+// Debounce a reflow so the phone layout repaints against the new geometry.
+if(window.visualViewport){
+  let _mobileViewportReflowTimer=0;
+  const _scheduleMobileViewportReflow=()=>{
+    if(_mobileViewportReflowTimer) clearTimeout(_mobileViewportReflowTimer);
+    _mobileViewportReflowTimer=setTimeout(()=>{
+      _mobileViewportReflowTimer=0;
+      _forceMobileViewportReflow();
+    },60);
+  };
+  window.visualViewport.addEventListener('resize', _scheduleMobileViewportReflow);
+  window.visualViewport.addEventListener('scroll', _scheduleMobileViewportReflow);
+}
 
 // Boot: restore last session or start fresh
 // ── Resizable panels ──────────────────────────────────────────────────────
